@@ -15,274 +15,401 @@ import dice_ml
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 
-# ==========================================
-# 1. SETUP & DYNAMIC DATA LOADING
-# ==========================================
+# 1. SETUP & DATA LOADING (UPDATED)
 @st.cache_resource
-def load_data_and_train_model():
+def load_data():
     try:
-        # Load the dataset
+        # Load dataset
         df = pd.read_csv("kidney_dataset.csv")
+        df.columns = df.columns.str.lower().str.strip()
 
-        # CLEANING: Remove 'id' column if it exists, as it's not a feature
-        if 'id' in df.columns:
-            df = df.drop(columns=['id'])
+        # Identify Target
+        target = None
+        candidates = ['classification', 'class', 'ckd', 'diagnosis', 'target']
+        for t in candidates:
+            if t in df.columns:
+                target = t
+                break
+        if target is None: target = df.columns[-1]
 
-    except FileNotFoundError:
-        # FALLBACK: Generate realistic Standard CKD columns if CSV is missing
-        # This ensures the app doesn't crash on the first run
-        np.random.seed(42)
-        rows = 100
-        data = {
-            'age': np.random.randint(20, 90, rows),
-            'bp': np.random.randint(50, 110, rows),           # Blood Pressure
-            'sg': np.random.choice([1.005, 1.010, 1.015, 1.020, 1.025], rows), # Specific Gravity
-            'al': np.random.choice([0, 1, 2, 3, 4, 5], rows), # Albumin
-            'su': np.random.choice([0, 1, 2, 3, 4, 5], rows), # Sugar
-            'rbc': np.random.choice(['normal', 'abnormal'], rows),
-            'pc': np.random.choice(['normal', 'abnormal'], rows),
-            'pcc': np.random.choice(['present', 'notpresent'], rows),
-            'ba': np.random.choice(['present', 'notpresent'], rows),
-            'bgr': np.random.uniform(70, 490, rows),          # Blood Glucose Random
-            'bu': np.random.uniform(10, 390, rows),           # Blood Urea
-            'sc': np.random.uniform(0.4, 15, rows),           # Serum Creatinine
-            'sod': np.random.uniform(100, 160, rows),         # Sodium
-            'pot': np.random.uniform(2.5, 7.5, rows),         # Potassium
-            'hemo': np.random.uniform(3, 17, rows),           # Hemoglobin
-            'pcv': np.random.randint(20, 50, rows),           # Packed Cell Volume
-            'wc': np.random.randint(2000, 20000, rows),       # WBC Count
-            'rc': np.random.uniform(2, 8, rows),              # RBC Count
-            'htn': np.random.choice(['yes', 'no'], rows),     # Hypertension
-            'dm': np.random.choice(['yes', 'no'], rows),      # Diabetes
-            'cad': np.random.choice(['yes', 'no'], rows),     # Coronary Artery Disease
-            'appet': np.random.choice(['good', 'poor'], rows),# Appetite
-            'pe': np.random.choice(['yes', 'no'], rows),      # Pedal Edema
-            'ane': np.random.choice(['yes', 'no'], rows),     # Anemia
-            'classification': np.random.choice(['ckd', 'notckd'], rows) # Target
+        # Clean Target
+        if df[target].dtype == 'object':
+            df[target] = df[target].astype(str).str.lower().str.strip()
+            df[target] = df[target].replace({'ckd\t': 'ckd', ' notckd': 'notckd'})
+            mapping = {'ckd': 1, 'notckd': 0, 'yes': 1, 'no': 0}
+            df[target] = df[target].map(mapping)
+            df = df.dropna(subset=[target])
+            df[target] = df[target].astype(int)
+
+        # Drop ID/Leakage
+        drop_keywords = ['id', 'unnamed']
+        cols_to_drop = [c for c in df.columns if any(k in c for k in drop_keywords)]
+        X = df.drop(columns=[target] + cols_to_drop, errors='ignore')
+        y = df[target]
+
+        # Identify Feature Types
+        num_cols = X.select_dtypes(include=['number']).columns.tolist()
+        cat_cols = X.select_dtypes(include=['object']).columns.tolist()
+
+        for col in num_cols:
+            if X[col].isnull().any():
+                median_val = X[col].median()
+                X[col] = X[col].fillna(median_val)
+                df[col] = df[col].fillna(median_val)
+
+        for col in cat_cols:
+            if X[col].isnull().any():
+                mode_val = X[col].mode()[0]
+                X[col] = X[col].fillna(mode_val)
+                df[col] = df[col].fillna(mode_val)
+
+        # Preprocessing Pipeline
+        preprocessor = ColumnTransformer([
+            ('num', Pipeline([('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())]), num_cols),
+            ('cat', Pipeline([('imputer', SimpleImputer(strategy='most_frequent')), ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))]), cat_cols)
+        ])
+
+        model = Pipeline([
+            ('preprocessor', preprocessor),
+            ('classifier', RandomForestClassifier(n_estimators=100, random_state=42, max_depth=10))
+        ])
+
+        # Split Data
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        model.fit(X_train, y_train)
+
+        y_pred = model.predict(X_test)
+        y_prob = model.predict_proba(X_test)[:, 1]  # Probabilities needed for ROC-AUC
+
+        metrics = {
+            "accuracy": accuracy_score(y_test, y_pred),
+            "precision": precision_score(y_test, y_pred),
+            "recall": recall_score(y_test, y_pred),
+            "f1": f1_score(y_test, y_pred),
+            "roc_auc": roc_auc_score(y_test, y_prob)
         }
-        df = pd.DataFrame(data)
 
-    # DETECT TARGET COLUMN (It's usually 'classification' or 'class' or 'CKD_Status')
-    target = None
-    possible_targets = ['classification', 'class', 'CKD_Status', 'target', 'diagnosis']
-    for t in possible_targets:
-        if t in df.columns:
-            target = t
-            break
+        return model, X_train, X_test, y_test, df, num_cols, cat_cols, target, metrics
 
-    if target is None:
-        target = df.columns[-1] # Fallback to last column
+    except Exception as e:
+        st.error(f"Setup Error: {e}")
+        return None, None, None, None, None, [], [], None, {}
 
-    # Clean Target: Map to 0 and 1 if it's string (ckd/notckd)
-    if df[target].dtype == 'object':
-        df[target] = df[target].astype(str).str.lower().map({'ckd': 1, 'notckd': 0, 'yes': 1, 'no': 0, '1': 1, '0': 0})
-        # Drop rows where target became NaN (invalid labels)
-        df = df.dropna(subset=[target])
-        df[target] = df[target].astype(int)
+# Execute Load
+model_pipeline, X_train, X_test, y_test, df_full, num_cols, cat_cols, target_col, metrics = load_data()
 
-    # SEPARATE FEATURES AND TARGET
-    X = df.drop(columns=[target])
-    y = df[target]
+#Smart suggestion
 
-    # Preprocessing Pipelines
-    numeric_cols = X.select_dtypes(include=['number']).columns
-    categorical_cols = X.select_dtypes(include=['object']).columns
+ADVICE_DB = {
+    'creat': "Limit red meat & creatine supplements. Hydrate.",
+    'gfr': "Plant-based diet, weight loss, and BP control.",
+    'urea': "Low-protein diet (limit dairy/meat).",
+    'bun': "Low-protein diet (limit dairy/meat).",
+    'bp': "DASH Diet (Low sodium).",
+    'sg': "Drink more water (dehydration indicator).",
+    'al': "Strictly limit salt <2300mg. Control blood sugar.",
+    'su': "Cut sugar/soda. Switch to whole grains.",
+    'hemo': "Iron-rich foods (spinach, beans, lean meat).",
+    'pot': "Avoid bananas/potatoes. Choose berries/apples.",
+    'sod': "Stop adding table salt. Rinse canned foods."
+}
 
-    preprocessor = ColumnTransformer([
-        ('num', Pipeline([('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())]), numeric_cols),
-        ('cat', Pipeline([('imputer', SimpleImputer(strategy='most_frequent')), ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))]), categorical_cols)
-    ])
+def get_smart_advice(col_name):
+    for key, advice in ADVICE_DB.items():
+        if key in col_name.lower(): return advice
+    return "Consult doctor for diet."
 
-    # Model
-    model = Pipeline([
-        ('preprocessor', preprocessor),
-        ('classifier', RandomForestClassifier(n_estimators=100, random_state=42))
-    ])
-
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    model.fit(X_train, y_train)
-
-    return model, X_train, df, numeric_cols, categorical_cols
-
-# Load Resources
-model_pipeline, X_train, df_full, num_cols, cat_cols = load_data_and_train_model()
-
-# ==========================================
-# 2. EXPLANATION LOGIC (SHAP & DiCE)
-# ==========================================
-def generate_shap_explanation(model, X_train, instance):
+def generate_shap(model, X_train, instance, role, pred_class):
     try:
-        preprocessor = model.named_steps['preprocessor']
-        classifier = model.named_steps['classifier']
-
-        # Transform
-        instance_trans = preprocessor.transform(instance)
-
-        # Calculate SHAP
-        explainer = shap.TreeExplainer(classifier)
+        prep = model.named_steps['preprocessor']
+        clf = model.named_steps['classifier']
+        instance_trans = prep.transform(instance)
+        explainer = shap.TreeExplainer(clf)
         shap_values = explainer.shap_values(instance_trans)
 
-        # Handle Binary Classification
-        if isinstance(shap_values, list):
-            vals = shap_values[1] # Class 1 (Risk)
-        else:
-            vals = shap_values
-
+        vals = shap_values[1] if isinstance(shap_values, list) else shap_values
         vals = np.array(vals).flatten()
+        feat_names = (prep.named_transformers_['num'].get_feature_names_out().tolist() +
+                      prep.named_transformers_['cat'].get_feature_names_out().tolist())
 
-        # Extract Feature Names
-        # Note: This relies on the transformers being named 'num' and 'cat'
-        num_names = preprocessor.named_transformers_['num'].get_feature_names_out().tolist()
-        cat_names = preprocessor.named_transformers_['cat'].get_feature_names_out().tolist()
-        feature_names = num_names + cat_names
-
-        # Safety Trim
-        min_len = min(len(vals), len(feature_names))
+        min_len = min(len(vals), len(feat_names))
+        feat_names = feat_names[:min_len]
         vals = vals[:min_len]
-        feature_names = feature_names[:min_len]
 
-        # Create DataFrame
-        feature_importance = pd.DataFrame({'col_name': feature_names, 'feature_importance_vals': vals})
-        feature_importance['abs_val'] = feature_importance['feature_importance_vals'].abs()
-        feature_importance = feature_importance.sort_values(by='abs_val', ascending=False).head(3)
+        df_imp = pd.DataFrame({'Feature': feat_names, 'Impact': vals})
+        df_imp['Feature'] = df_imp['Feature'].str.replace('num__', '').str.replace('cat__', '')
+        df_imp['Abs'] = df_imp['Impact'].abs()
+        df_imp = df_imp.sort_values('Abs', ascending=False).head(5)
 
-        text = "Based on the AI analysis, the **top 3 factors** driving this prediction are:\n"
-        for _, row in feature_importance.iterrows():
-            # Clean up feature names (remove "num__" or "cat__")
-            clean_name = row['col_name'].replace("num__", "").replace("cat__", "")
-            impact = "Increases Risk 🔺" if row['feature_importance_vals'] > 0 else "Reduces Risk 🔻"
-            text += f"- **{clean_name}**: {impact}\n"
-        return text, feature_importance
-
+        if role == "Doctor 🩺":
+            return "### 🔍 Root Cause Analysis (SHAP)", df_imp[['Feature', 'Impact']]
+        else:
+            txt = "### ⚠️ Why is my risk high?\nFactors driving risk UP:\n" if pred_class == 1 else "### ✅ Why is my risk low?\nFactors keeping you healthy:\n"
+            for _, r in df_imp.iterrows():
+                name = r['Feature'].split('_')[0].capitalize()
+                txt += f"- **{name}**\n"
+            return txt, None
     except Exception as e:
-        return f"Could not generate SHAP explanation. (Error: {str(e)})", None
+        return f"Error: {e}", None
 
-def generate_dice_counterfactual(model, df_full, instance):
+def generate_dice(model, df, instance, target, role):
     try:
-        # Re-identify target column name from the full dataframe
-        target_name = df_full.columns[-1] # Assuming target is last
-        if 'classification' in df_full.columns: target_name = 'classification'
-        elif 'class' in df_full.columns: target_name = 'class'
-        elif 'CKD_Status' in df_full.columns: target_name = 'CKD_Status'
-
-        # Setup DiCE
-        d = dice_ml.Data(dataframe=df_full, continuous_features=num_cols.tolist(), outcome_name=target_name)
+        d = dice_ml.Data(dataframe=df, continuous_features=num_cols, outcome_name=target)
         m = dice_ml.Model(model=model, backend="sklearn")
         exp = dice_ml.Dice(d, m, method="random")
+        e = exp.generate_counterfactuals(instance, total_CFs=1, desired_class=0)
 
-        # Generate
-        e1 = exp.generate_counterfactuals(instance, total_CFs=1, desired_class=0)
-        cf_df = e1.cf_examples_list[0].final_cfs_df
+        cf_df = e.cf_examples_list[0].final_cfs_df
+        original = instance.iloc[0]
+        new_vals = cf_df.iloc[0].copy()
 
-        return "To potentially reverse the risk, consider aiming for these values:", cf_df
-    except Exception as e:
-        return f"No simple actionable changes found for this case. (Error: {str(e)})", None
+        if 'age' in new_vals: new_vals['age'] = original['age']
+        is_gfr_improved = (new_vals.get('gfr', 0) > 60) and (original.get('gfr', 0) < 60)
 
-# ==========================================
-# 3. STREAMLIT UI
-# ==========================================
-st.set_page_config(layout="wide", page_title="Medical AI Assistant")
+        if is_gfr_improved:
+            for col in ['creatinine', 'sc']:
+                for c in df.columns:
+                    if col in c: new_vals[c] = 1.1
+            for col in ['bun', 'urea']:
+                for c in df.columns:
+                    if col in c: new_vals[c] = 18.0
 
-st.sidebar.header("📝 Patient Vitals")
-st.sidebar.markdown("The inputs below are **automatically generated** based on your dataset columns.")
+        changes = []
+        for col in num_cols:
+            if 'age' in col: continue
+            diff = new_vals[col] - original[col]
+            if abs(diff) > 0.01:
+                advice = get_smart_advice(col)
+                changes.append({"Feature": col, "Current": original[col], "Target": new_vals[col], "Advice": advice})
 
-# --- DYNAMIC INPUT GENERATION ---
-user_inputs = {}
-
-# 1. Numeric Inputs (Sliders)
-for col in num_cols:
-    # Calculate min, max, and mean for default values
-    min_val = float(df_full[col].min())
-    max_val = float(df_full[col].max())
-    mean_val = float(df_full[col].mean())
-
-    # Create slider
-    user_inputs[col] = st.sidebar.slider(
-        label=col.capitalize(),
-        min_value=min_val,
-        max_value=max_val,
-        value=mean_val
-    )
-
-# 2. Categorical Inputs (Dropdowns)
-for col in cat_cols:
-    # Get unique options
-    options = df_full[col].unique().tolist()
-    # Create dropdown
-    user_inputs[col] = st.sidebar.selectbox(
-        label=col.capitalize(),
-        options=options
-    )
-
-# Convert dictionary to DataFrame for prediction
-input_df = pd.DataFrame([user_inputs])
-
-# --- MAIN DASHBOARD ---
-col1, col2 = st.columns([1, 2])
-
-with col1:
-    st.subheader("Patient Profile")
-    st.markdown("Overview of the data entered in the sidebar:")
-    # Transpose for easier reading
-    st.dataframe(input_df.astype(str).T, use_container_width=True)
-
-with col2:
-    st.subheader("Diagnosis & Explanation")
-
-    if st.button("Run Diagnostics", type="primary"):
-        # Predict
-        pred = model_pipeline.predict(input_df)[0]
-        prob = model_pipeline.predict_proba(input_df)[0][1]
-
-        st.session_state['pred'] = pred
-        st.session_state['prob'] = prob
-        st.session_state['run'] = True
-
-    if st.session_state.get('run'):
-        # Display Prediction
-        if st.session_state['pred'] == 1:
-            st.error(f"⚠️ **High Risk Detected** (Confidence: {st.session_state['prob']:.1%})")
+        if role == "Doctor 🩺":
+            if not changes: return "No modifiable risk factors.", None
+            return "### 📋 Recommended Adjustments", pd.DataFrame(changes)
         else:
-            st.success(f"✅ **Low Risk Detected** (Confidence: {(1-st.session_state['prob']):.1%})")
+            if not changes: return "Maintain healthy lifestyle.", None
+            txt = "### ✅ Action Plan\n"
+            for c in changes:
+                direction = "Lower" if c['Target'] < c['Current'] else "Increase"
+                clean = c['Feature'].replace('_', ' ').capitalize()
+                txt += f"- **{direction} {clean}**: {c['Advice']}\n"
+            return txt, None
+    except Exception as e:
+        return f"Analysis unavailable: {e}", None
 
-        st.divider()
+#regulator audit function
+def calculate_bias(model, X_test, y_test, df_full):
+    test_indices = X_test.index
+    df_audit = df_full.loc[test_indices].copy()
+    df_audit['Target'] = y_test
+    df_audit['Prediction'] = model.predict(X_test)
+    df_audit['Correct'] = df_audit['Target'] == df_audit['Prediction']
+    df_audit['Age_Group'] = pd.cut(df_audit['age'], bins=[0, 40, 60, 100], labels=['<40', '40-60', '>60'])
+    bias_table = df_audit.groupby('Age_Group', observed=False)['Correct'].mean().reset_index()
+    bias_table.columns = ['Age Group', 'Accuracy']
+    bias_table['Accuracy'] = bias_table['Accuracy'] * 100
+    return bias_table
 
-        # Interactive Q&A
-        st.markdown("### 💬 AI Consultation")
-        st.info("Ask questions in plain English. Examples: *'Why is the risk high?'*, *'What changes can I make?'*")
+def plot_global_shap(model, X_train):
+    prep = model.named_steps['preprocessor']
+    clf = model.named_steps['classifier']
+    sample = X_train.sample(min(100, len(X_train)))
+    sample_trans = prep.transform(sample)
+    explainer = shap.TreeExplainer(clf)
+    shap_values = explainer.shap_values(sample_trans)
+    vals = np.abs(shap_values[1]).mean(0)
+    feat_names = (prep.named_transformers_['num'].get_feature_names_out().tolist() +
+                  prep.named_transformers_['cat'].get_feature_names_out().tolist())
+    min_len = min(len(vals), len(feat_names))
+    feat_names = feat_names[:min_len]
+    vals = vals[:min_len]
+    df = pd.DataFrame({'Feature': feat_names, 'Importance': vals})
+    df['Feature'] = df['Feature'].str.replace('num__', '').str.replace('cat__', '')
+    return df.sort_values('Importance', ascending=False).head(10)
 
-        user_q = st.text_input("Type your question here:")
+#UI
+st.set_page_config(layout="wide", page_title="Kidney AI System")
+col_h1, col_h2 = st.columns([3, 1])
+with col_h1: st.title("🩺 Kidney Health AI System")
+with col_h2: role = st.selectbox("View as:", ["Patient 👤", "Doctor 🩺", "Regulator ⚖️"])
 
-        if user_q:
-            q = user_q.lower()
 
-            # INTENT: Feature Importance (SHAP)
-            if any(x in q for x in ["why", "reason", "cause", "factor", "attribute"]):
-                st.markdown("#### 🔍 Root Cause Analysis (SHAP)")
-                with st.spinner("Analyzing patient data..."):
-                    txt, sdf = generate_shap_explanation(model_pipeline, X_train, input_df)
-                    st.write(txt)
-                    if sdf is not None:
-                        # Clean names for chart
-                        sdf['clean_name'] = sdf['col_name'].str.replace('num__', '').str.replace('cat__', '')
-                        st.bar_chart(sdf.set_index('clean_name')['feature_importance_vals'])
+# VIEW: REGULATOR
+if role == "Regulator ⚖️":
+    st.header("🛡️ AI Governance Dashboard")
+    st.markdown("Real-time audit of Model Performance, Fairness, and Logic Safety.")
 
-            # INTENT: Counterfactuals (DiCE)
-            elif any(x in q for x in ["change", "how to", "what if", "reduce", "improve"]):
-                st.markdown("#### 🔮 Actionable Insights (DiCE)")
-                if st.session_state['pred'] == 0:
-                    st.write("Patient is already Low Risk. No changes needed.")
-                else:
-                    with st.spinner("Calculating recovery path..."):
-                        txt, cdf = generate_dice_counterfactual(model_pipeline, df_full, input_df)
-                        st.write(txt)
-                        if cdf is not None:
-                            st.dataframe(cdf)
+    # metrics card
+    with st.container(border=True):
+        st.subheader("1. Model Performance (Test Set)")
+        k1, k2, k3, k4, k5 = st.columns(5)
 
-            else:
-                st.warning("I didn't understand. Try asking about 'causes' or 'changes'.")
+        k1.metric("Accuracy", f"{metrics['accuracy']:.4f}", help="Overall correctness")
+        k2.metric("Precision", f"{metrics['precision']:.4f}", help="Positive Predictive Value")
+        k3.metric("Recall", f"{metrics['recall']:.4f}", help="Sensitivity (Critical for Medical)")
+        k4.metric("F1-score", f"{metrics['f1']:.4f}", help="Harmonic Mean")
+        k5.metric("ROC-AUC", f"{metrics['roc_auc']:.4f}", help="Area Under Curve (Discrimination Ability)")
+
+    # SHAP visual
+    col_left, col_right = st.columns([1, 1])
+    with col_left:
+        with st.container(border=True):
+            st.subheader("2. Fairness Audit (Age Bias)")
+            st.caption("Performance disparity across age groups.")
+            bias_df = calculate_bias(model_pipeline, X_test, y_test, df_full)
+            st.bar_chart(bias_df.set_index('Age Group'), color="#36A2EB")
+            st.dataframe(bias_df.style.format({"Accuracy": "{:.1f}%"}), use_container_width=True, hide_index=True)
+
+    with col_right:
+        with st.container(border=True):
+            st.subheader("3. Logic Audit (Global SHAP)")
+            st.caption("Top features driving decisions.")
+            global_shap = plot_global_shap(model_pipeline, X_train)
+            st.bar_chart(global_shap.set_index('Feature'), color="#FF6384")
+            top_feature = global_shap.iloc[0]['Feature']
+            st.success(f"✅ **Logic Check:** Top Driver is **'{top_feature}'**.")
+
+    # safety stress test
+    with st.container(border=True):
+        st.subheader("4. Safety Protocol Stress Test (DiCE)")
+        s1, s2 = st.columns([1, 3])
+        run_test = s1.button("🚨 Run Live Stress Test", use_container_width=True)
+
+        if run_test:
+            with st.spinner("Auditing optimization constraints..."):
+                sample = df_full[df_full[target_col] == 1].sample(5)
+                results = []
+                violations = 0
+                avg_changes = 0
+                for i in range(len(sample)):
+                    pt = sample.iloc[[i]].drop(columns=[target_col], errors='ignore')
+                    d = dice_ml.Data(dataframe=df_full, continuous_features=num_cols, outcome_name=target_col)
+                    m = dice_ml.Model(model=model_pipeline, backend="sklearn")
+                    e = dice_ml.Dice(d, m, method="random").generate_counterfactuals(pt, total_CFs=1, desired_class=0)
+
+                    cf_df = e.cf_examples_list[0].final_cfs_df
+                    original = pt.iloc[0]
+                    new_vals = cf_df.iloc[0]
+
+                    age_changed = abs(new_vals['age'] - original['age']) > 0.01
+                    if age_changed: violations += 1
+
+                    changes = 0
+                    for col in num_cols:
+                        if abs(new_vals[col] - original[col]) > 0.01: changes += 1
+                    avg_changes += changes
+
+                    results.append({"Patient ID": i+1, "Changes": changes, "Age Violation": "⚠️ FAIL" if age_changed else "✅ PASS"})
+
+                avg_changes = avg_changes / 5
+                with s2:
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Avg. Changes", f"{avg_changes:.1f}")
+                    m2.metric("Violations", f"{violations}/5")
+                    m3.metric("Status", "✅ PASSED" if violations == 0 else "❌ FAILED")
+                    st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+        else:
+            with s2: st.info("Click 'Run Live Stress Test' to audit the counterfactual engine.")
+
+    #Interactive Chat
+    st.markdown("---")
+    with st.expander("💬 Open Interactive Auditor Terminal", expanded=True):
+        if "reg_messages" not in st.session_state:
+            st.session_state.reg_messages = [{"role": "ai", "content": "System Auditor Online. Query me on **Bias**, **Overfitting**, or **Safety**."}]
+
+        for msg in st.session_state.reg_messages:
+            with st.chat_message(msg["role"]):
+                st.write(msg["content"])
+                if "data" in msg and msg['data'] is not None:
+                    if msg['type'] == 'df': st.dataframe(msg['data'], hide_index=True)
+                    if msg['type'] == 'chart': st.bar_chart(msg['data'])
+
+        def submit_reg_chat():
+            user_input = st.session_state.reg_input
+            if user_input:
+                st.session_state.reg_messages.append({"role": "user", "content": user_input})
+                response = "I didn't understand. Ask about Bias, Overfitting, or Safety."
+                data = None
+                type_ = None
+                q = user_input.lower()
+
+                if "bias" in q or "fair" in q:
+                    response = "Bias Report (Age Group Accuracy):"
+                    data = calculate_bias(model_pipeline, X_test, y_test, df_full)
+                    type_ = 'df'
+                elif "overfit" in q:
+                    response = f"Gap: {metrics['test_acc'] - metrics['train_acc']:.1%}"
+                elif "shap" in q or "logic" in q:
+                    response = "Global Feature Importance:"
+                    data = plot_global_shap(model_pipeline, X_train).set_index('Feature')
+                    type_ = 'chart'
+
+                st.session_state.reg_messages.append({"role": "ai", "content": response, "data": data, "type": type_})
+                st.session_state.reg_input = ""
+
+        st.text_input("Audit Query:", key="reg_input", on_change=submit_reg_chat, placeholder="e.g., 'Is there age bias?'")
+
+# VIEW: PATIENT / DOCTOR
+else:
+    st.sidebar.header("Patient Data")
+    if df_full is not None:
+        if st.sidebar.button("🎲 Load Random Patient"):
+            row = df_full.sample(1).iloc[0]
+            for c in num_cols + cat_cols: st.session_state[f"input_{c}"] = row[c]
+            st.session_state['messages'] = []
+            if 'result' in st.session_state: del st.session_state['result']
+
+        user_inputs = {}
+        for col in num_cols:
+            val = st.session_state.get(f"input_{col}", float(df_full[col].mean()))
+            user_inputs[col] = st.sidebar.number_input(col, value=float(val), key=f"input_{col}")
+        for col in cat_cols:
+            options = list(map(str, df_full[col].unique()))
+            saved_val = str(st.session_state.get(f"input_{col}", options[0]))
+            try: idx = options.index(saved_val)
+            except: idx = 0
+            user_inputs[col] = st.sidebar.selectbox(col, options, index=idx, key=f"input_{col}")
+
+        input_df = pd.DataFrame([user_inputs])
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        st.subheader("Current Vitals")
+        st.dataframe(input_df.T, use_container_width=True)
+
+    with col2:
+        if st.button("Run Diagnostics", type="primary", use_container_width=True):
+            pred = model_pipeline.predict(input_df)[0]
+            prob = model_pipeline.predict_proba(input_df)[0][1]
+            st.session_state['result'] = (pred, prob)
+            st.session_state['messages'] = [{"role": "ai", "content": "Analysis Complete."}]
+
+        if 'result' in st.session_state:
+            pred, prob = st.session_state['result']
+            if pred == 1: st.error(f"⚠️ High Risk Detected (Confidence: {prob:.1%})")
+            else: st.success(f"✅ Low Risk (Confidence: {(1-prob):.1%})")
+
+            c1, c2 = st.columns(2)
+            label_why = "❓ Why High?" if pred == 1 else "❓ Why Low?"
+            label_how = "💊 How to Fix?" if pred == 1 else "💎 How to Maintain?"
+
+            if c1.button(label_why):
+                msg, data = generate_shap(model_pipeline, X_train, input_df, role, pred)
+                st.session_state.messages.append({"role": "user", "content": "Why?"})
+                st.session_state.messages.append({"role": "ai", "content": msg, "data": data, "type": "chart"})
+
+            if c2.button(label_how):
+                msg, data = generate_dice(model_pipeline, df_full, input_df, target_col, role)
+                st.session_state.messages.append({"role": "user", "content": "How?"})
+                st.session_state.messages.append({"role": "ai", "content": msg, "data": data, "type": "df"})
+
+            for msg in st.session_state.messages:
+                with st.chat_message(msg['role']):
+                    st.write(msg['content'])
+                    if "data" in msg and msg['data'] is not None:
+                        if msg['type'] == 'chart': st.bar_chart(msg['data'].set_index('Feature'))
+                        if msg['type'] == 'df': st.dataframe(msg['data'], hide_index=True)
